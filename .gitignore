@@ -1,0 +1,33 @@
+# Python
+_pycache_/
+*.py[cod]
+*.pyo
+*.pyd
+*.pickle
+*.log
+*.h5
+
+# Virtual environment
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# Jupyter/Colab
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Cache
+*.cache
+*.bak
+*.tmp
+
+# Flask instance folder (jika ada)
+instance/
+
+# Pytest cache
+.pytest_cache/
