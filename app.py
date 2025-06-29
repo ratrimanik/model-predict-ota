@@ -9,217 +9,103 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from google_play_scraper import reviews, Sort
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
+CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}}) # supaya bisa diakses oleh FE
+# Preprocessing teks
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    return text
 
-# Constants
-APP_IDS = {
-    "traveloka": "com.traveloka.android",
-    "tiket": "com.tiket.gits",
-    "agoda": "com.agoda.mobile.consumer"
-}
+# Load semua file model
+def load_models(source_folder):
+    base_path = os.path.join(os.getcwd(), source_folder)
+    # Sentimen model
+    sentiment_model = load_model(os.path.join(base_path, 'bilstm_sentiment_model.h5'))
+    with open(os.path.join(base_path, 'tokenizer.pickle'), 'rb') as f:
+        tokenizer = pickle.load(f)
+    with open(os.path.join(base_path, 'model_seq.pickle'), 'rb') as f:
+        config = pickle.load(f)
+    max_len = config['max_sequence_length']
+    with open(os.path.join(base_path, 'label_encoder_sentimen.pkl'), 'rb') as f:
+        label_encoder_sentimen = pickle.load(f)
 
-VALID_SOURCES = ['agoda', 'traveloka', 'tiket', 'user']
-REQUIRED_COLUMNS = ['review', 'sentiment', 'kategori', 'tanggal']
-MODEL_FOLDER = "trying"
+    # Kategori model
+    kategori_model = joblib.load(os.path.join(base_path, 'logreg_kategori_model.pkl'))
+    tfidf_vectorizer = joblib.load(os.path.join(base_path, 'tfidf_vectorizer.pkl'))
+    with open(os.path.join(base_path, 'label_encoder_kategori.pkl'), 'rb') as f:
+        label_encoder_kategori = pickle.load(f)
 
-class ModelManager:
-    """Handles loading and managing ML models"""
-    
-    def __init__(self, model_folder: str):
-        self.model_folder = model_folder
-        self._models = None
-    
-    @property
-    def models(self) -> Dict[str, Any]:
-        """Lazy load models"""
-        if self._models is None:
-            self._models = self._load_models()
-        return self._models
-    
-    def _load_models(self) -> Dict[str, Any]:
-        """Load all ML models and components"""
-        base_path = os.path.join(os.getcwd(), self.model_folder)
-        
-        try:
-            # Load sentiment model components
-            sentiment_model = load_model(os.path.join(base_path, 'bilstm_sentiment_model.h5'))
-            
-            with open(os.path.join(base_path, 'tokenizer.pickle'), 'rb') as f:
-                tokenizer = pickle.load(f)
-            
-            with open(os.path.join(base_path, 'model_seq.pickle'), 'rb') as f:
-                config = pickle.load(f)
-            
-            with open(os.path.join(base_path, 'label_encoder_sentimen.pkl'), 'rb') as f:
-                label_encoder_sentimen = pickle.load(f)
-            
-            # Load category model components
-            kategori_model = joblib.load(os.path.join(base_path, 'logreg_kategori_model.pkl'))
-            tfidf_vectorizer = joblib.load(os.path.join(base_path, 'tfidf_vectorizer.pkl'))
-            
-            with open(os.path.join(base_path, 'label_encoder_kategori.pkl'), 'rb') as f:
-                label_encoder_kategori = pickle.load(f)
-            
-            return {
-                "sentiment_model": sentiment_model,
-                "tokenizer": tokenizer,
-                "max_len": config['max_sequence_length'],
-                "label_encoder_sentimen": label_encoder_sentimen,
-                "kategori_model": kategori_model,
-                "tfidf_vectorizer": tfidf_vectorizer,
-                "label_encoder_kategori": label_encoder_kategori
-            }
-        except Exception as e:
-            app.logger.error(f"Failed to load models: {str(e)}")
-            return {}
+    return {
+        "sentiment_model": sentiment_model,
+        "tokenizer": tokenizer,
+        "max_len": max_len,
+        "label_encoder_sentimen": label_encoder_sentimen,
+        "kategori_model": kategori_model,
+        "tfidf_vectorizer": tfidf_vectorizer,
+        "label_encoder_kategori": label_encoder_kategori
+    }
 
-class DataManager:
-    """Handles dataset operations"""
-    
-    @staticmethod
-    def get_dataset_path(source: str) -> str:
-        """Get path to dataset file"""
-        return os.path.join(os.getcwd(), source, 'kategori.xlsx')
-    
-    @staticmethod
-    def preprocess_text(text: str) -> str:
-        """Clean and preprocess text"""
-        text = text.lower()
-        text = re.sub(r'[^\w\s]', '', text)
-        return text
-    
-    @staticmethod
-    def load_dataset(source: str) -> pd.DataFrame:
-        """Load and standardize dataset"""
-        file_path = DataManager.get_dataset_path(source)
-        
-        if not os.path.exists(file_path):
-            if source == 'user':
-                # Create empty user dataset if it doesn't exist
-                df = pd.DataFrame(columns=REQUIRED_COLUMNS)
-                df.to_excel(file_path, index=False)
-                return df
-            else:
-                raise FileNotFoundError(f"Dataset file not found: {file_path}")
-        
-        df = pd.read_excel(file_path)
-        df.columns = [col.lower().strip() for col in df.columns]
-        
-        # Ensure required columns exist
-        for col in REQUIRED_COLUMNS:
-            if col not in df.columns:
-                df[col] = ""
-        
-        return df
-    
-    @staticmethod
-    def save_dataset(df: pd.DataFrame, source: str) -> None:
-        """Save dataset to file"""
-        file_path = DataManager.get_dataset_path(source)
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        df.to_excel(file_path, index=False)
-    
-    @staticmethod
-    def filter_by_date_range(df: pd.DataFrame, start_year: int = 2024, end_year: int = 2025) -> pd.DataFrame:
-        """Filter dataframe by date range"""
-        if 'tanggal' not in df.columns:
-            return df
-        
-        df['tanggal'] = pd.to_datetime(df['tanggal'], errors='coerce')
-        return df[(df['tanggal'].dt.year >= start_year) & (df['tanggal'].dt.year <= end_year)]
+# Helper Function
+def dataset_path(source):
+    return os.path.join(os.getcwd(), source, 'kategori.xlsx')
 
-class SentimentAnalyzer:
-    """Handles sentiment and category analysis"""
-    
-    def __init__(self, model_manager: ModelManager):
-        self.model_manager = model_manager
-    
-    def predict_sentiment_and_category(self, text: str) -> Tuple[str, str]:
-        """Predict sentiment and category for given text"""
-        models = self.model_manager.models
-        if not models:
-            raise RuntimeError("Models not loaded")
-        
-        cleaned_text = DataManager.preprocess_text(text)
-        
-        # Predict sentiment
-        seq = models["tokenizer"].texts_to_sequences([cleaned_text])
-        padded = pad_sequences(seq, maxlen=models["max_len"], padding='post')
-        sent_pred = models["sentiment_model"].predict(padded)[0][0]
-        sent_label = 1 if sent_pred > 0.5 else 0
-        sentiment = models["label_encoder_sentimen"].inverse_transform([sent_label])[0]
-        
-        # Predict category
-        tfidf_input = models["tfidf_vectorizer"].transform([cleaned_text])
-        kategori_pred = models["kategori_model"].predict(tfidf_input)
-        category = models["label_encoder_kategori"].inverse_transform(kategori_pred)[0]
-        
-        return sentiment, category
-
-# Initialize managers
-model_manager = ModelManager(MODEL_FOLDER)
-data_manager = DataManager()
-analyzer = SentimentAnalyzer(model_manager)
-
-# Helper functions
-def validate_source(source: str) -> bool:
-    """Validate if source is allowed"""
-    return source in VALID_SOURCES
-
-def create_error_response(message: str, status_code: int = 400) -> Tuple[Dict, int]:
-    """Create standardized error response"""
-    return jsonify({"error": message}), status_code
-
-def create_success_response(data: Any, message: str = None) -> Dict:
-    """Create standardized success response"""
-    response = {"data": data}
-    if message:
-        response["message"] = message
-    return jsonify(response)
-
-# API Endpoints
+# API tampil dataset
 @app.route("/dataset", methods=["GET"])
-def get_dataset():
-    """Get dataset for specific source"""
+def get_data():
     source = request.args.get("source")
-    
-    if not source or not validate_source(source):
-        return create_error_response("Invalid or missing source")
-    
+    if not source or source not in ['agoda', 'traveloka', 'tiket']:
+        return jsonify({"error": "Invalid or missing source"}), 400
+
     try:
-        df = data_manager.load_dataset(source)
-        
-        # Sort by batch if available, otherwise by index
+        file_path = dataset_path(source)
+        if not os.path.exists(file_path):
+            return jsonify({"error": f"File not found: {file_path}"}), 404
+
+        df = pd.read_excel(file_path)
+        df.columns = [col.lower() for col in df.columns]
+
+        # Urutkan berdasarkan batch DESC jika ada
         if 'batch' in df.columns:
             df = df.sort_values(by='batch', ascending=False)
-        
-        data = df[REQUIRED_COLUMNS + (['batch'] if 'batch' in df.columns else [])].to_dict(orient="records")
-        return create_success_response(data)
-        
-    except Exception as e:
-        app.logger.error(f"Error loading dataset for {source}: {str(e)}")
-        return create_error_response(f"Failed to load dataset: {str(e)}", 500)
 
+        expected_columns = {'sentiment', 'kategori', 'review', 'tanggal'}
+        missing_columns = expected_columns - set(df.columns)
+        if missing_columns:
+            return jsonify({
+                "error": f"Missing expected columns: {', '.join(missing_columns)}"
+            }), 500
+
+        data = df[['review', 'sentiment', 'kategori', 'batch']].to_dict(orient="records")
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": f"Gagal membaca dataset: {str(e)}"}), 500
+
+# API jumlah dataset
 @app.route("/dataset/stats", methods=["GET"])
-def get_dataset_stats():
-    """Get dataset statistics"""
+def get_distribution_stats():
     source = request.args.get("source")
-    
-    if not source or source not in ['agoda', 'traveloka', 'tiket']:
-        return create_error_response("Invalid source")
-    
+    if source not in ['agoda', 'traveloka', 'tiket']:
+        return jsonify({"error": "Invalid source"}), 400
     try:
-        df = data_manager.load_dataset(source)
-        df = data_manager.filter_by_date_range(df)
-        
-        # Calculate statistics
+        file_path = dataset_path(source)
+        df = pd.read_excel(file_path)
+
+        df.columns = [col.lower() for col in df.columns] # lowercase kolom
+
+        # Pastikan kolom 'tanggal' ada
+        if 'tanggal' not in df.columns:
+            return jsonify({"error": "Kolom 'tanggal' tidak ditemukan"}), 400
+        df['tanggal'] = pd.to_datetime(df['tanggal'], errors='coerce')
+
+        # Filter data hanya untuk tahun 2024-2025
+        df = df[(df['tanggal'].dt.year >= 2024) & (df['tanggal'].dt.year <= 2025)]
         sentimen_count = df['sentiment'].str.lower().value_counts().to_dict()
         kategori_count = df['kategori'].str.lower().value_counts().to_dict()
-        
-        # Category-sentiment distribution
+
+        # Hitung distribusi kategori per sentimen
         kategori_sentimen = {}
         for _, row in df.iterrows():
             kat = str(row['kategori']).strip().lower()
@@ -228,16 +114,18 @@ def get_dataset_stats():
                 kategori_sentimen[kat] = {"positif": 0, "negatif": 0}
             if sent in kategori_sentimen[kat]:
                 kategori_sentimen[kat][sent] += 1
-        
-        # Monthly sentiment data
-        df['bulan'] = df['tanggal'].dt.to_period("M").astype(str)
+
+        df['bulan'] = df['tanggal'].dt.to_period("M").astype(str)  # e.g. '2024-01'
+
+        # Hitung jumlah sentimen per bulan
         monthly_sentiment = (
             df.groupby(['bulan', 'sentiment'])
             .size()
             .unstack(fill_value=0)
             .reset_index()
         )
-        
+
+        # Format agar cocok dengan line chart frontend
         monthly_sentiment_data = []
         for _, row in monthly_sentiment.iterrows():
             monthly_sentiment_data.append({
@@ -245,100 +133,102 @@ def get_dataset_stats():
                 "Positif": row.get('positif', 0),
                 "Negatif": row.get('negatif', 0)
             })
-        
-        stats = {
+
+        return jsonify({
             "sentimen": sentimen_count,
             "kategori": kategori_count,
             "kategori_sentimen": kategori_sentimen,
-            "monthly_sentiment": monthly_sentiment_data
-        }
-        
-        return create_success_response(stats)
-        
-    except Exception as e:
-        app.logger.error(f"Error getting stats for {source}: {str(e)}")
-        return create_error_response(f"Failed to get statistics: {str(e)}", 500)
+            "monthly_sentiment": monthly_sentiment_data 
+        })
 
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# API Compare
 @app.route("/dataset/compare-sentiment", methods=["GET"])
-def compare_sentiment():
-    """Compare sentiment across all sources"""
+def compare_sentiment_across_sources():
     sources = ['agoda', 'traveloka', 'tiket']
     comparison = []
     monthly_comparison = {}
     kategori_comparison = {}
-    
+
     try:
         for source in sources:
-            try:
-                df = data_manager.load_dataset(source)
-                df = data_manager.filter_by_date_range(df)
-                
-                # Sentiment totals
-                sentiment_counts = df['sentiment'].str.lower().value_counts().to_dict()
-                comparison.append({
-                    "source": source.capitalize(),
-                    "positif": sentiment_counts.get("positif", 0),
-                    "negatif": sentiment_counts.get("negatif", 0),
-                })
-                
-                # Monthly data
-                df['bulan'] = df['tanggal'].dt.to_period("M").astype(str)
-                monthly = df.groupby(['bulan', 'sentiment']).size().unstack(fill_value=0).reset_index()
-                formatted_monthly = []
-                for _, row in monthly.iterrows():
-                    formatted_monthly.append({
-                        "bulan": row['bulan'],
-                        "Positif": row.get('positif', 0),
-                        "Negatif": row.get('negatif', 0),
-                    })
-                monthly_comparison[source.capitalize()] = formatted_monthly
-                
-                # Category data
-                if 'kategori' in df.columns:
-                    kategori_sentimen_counts = (
-                        df.groupby(['kategori', 'sentiment'])
-                          .size()
-                          .unstack(fill_value=0)
-                          .reset_index()
-                    )
-                    
-                    kategori_result = {}
-                    for _, row in kategori_sentimen_counts.iterrows():
-                        kategori_result[row['kategori']] = {
-                            "positif": int(row.get('positif', 0)),
-                            "negatif": int(row.get('negatif', 0)),
-                        }
-                    
-                    kategori_comparison[source.capitalize()] = kategori_result
-                    
-            except Exception as e:
-                app.logger.warning(f"Error processing {source}: {str(e)}")
+            file_path = dataset_path(source)
+            df = pd.read_excel(file_path)
+            df.columns = [col.lower() for col in df.columns]
+
+            if 'tanggal' not in df.columns or 'sentiment' not in df.columns:
                 continue
-        
-        result = {
+
+            df['tanggal'] = pd.to_datetime(df['tanggal'], errors='coerce')
+            df = df[(df['tanggal'].dt.year >= 2024) & (df['tanggal'].dt.year <= 2025)]
+
+            # === Pie Chart Sentimen Total ===
+            sentiment_counts = df['sentiment'].str.lower().value_counts().to_dict()
+            comparison.append({
+                "source": source.capitalize(),
+                "positif": sentiment_counts.get("positif", 0),
+                "negatif": sentiment_counts.get("negatif", 0),
+            })
+
+            # === Line Chart Sentimen Bulanan ===
+            df['bulan'] = df['tanggal'].dt.to_period("M").astype(str)
+            monthly = df.groupby(['bulan', 'sentiment']).size().unstack(fill_value=0).reset_index()
+            formatted_monthly = []
+            for _, row in monthly.iterrows():
+                formatted_monthly.append({
+                    "bulan": row['bulan'],
+                    "Positif": row.get('positif', 0),
+                    "Negatif": row.get('negatif', 0),
+                })
+            monthly_comparison[source.capitalize()] = formatted_monthly
+
+            # === Bar Chart Kategori per Aplikasi dengan Sentimen ===
+            if 'kategori' in df.columns:
+                kategori_sentimen_counts = (
+                    df.groupby(['kategori', 'sentiment'])
+                      .size()
+                      .unstack(fill_value=0)
+                      .reset_index()
+                )
+
+                kategori_result = {}
+                for _, row in kategori_sentimen_counts.iterrows():
+                    kategori_result[row['kategori']] = {
+                        "positif": int(row.get('positif', 0)),
+                        "negatif": int(row.get('negatif', 0)),
+                    }
+
+                kategori_comparison[source.capitalize()] = kategori_result
+
+        return jsonify({
             "comparison": comparison,
             "monthly_comparison": monthly_comparison,
             "kategori_comparison": kategori_comparison
-        }
-        
-        return create_success_response(result)
-        
-    except Exception as e:
-        app.logger.error(f"Error in comparison: {str(e)}")
-        return create_error_response(f"Failed to compare data: {str(e)}", 500)
+        })
 
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Update Dataset
 @app.route("/dataset/update", methods=["POST"])
 def update_dataset():
-    """Update dataset by scraping new reviews"""
     data = request.get_json()
     source = data.get("source")
-    
-    if source not in APP_IDS:
-        return create_error_response("Invalid source")
-    
+
+    app_ids = {
+        "traveloka": "com.traveloka.android",
+        "tiket": "com.tiket.gits",
+        "agoda": "com.agoda.mobile.consumer"
+    }
+
+    if source not in app_ids:
+        return jsonify({"error": "Invalid source"}), 400
+
     try:
-        app_id = APP_IDS[source]
-        
+        app_id = app_ids[source]
+
         # Scrape reviews
         result, _ = reviews(
             app_id,
@@ -347,219 +237,331 @@ def update_dataset():
             sort=Sort.MOST_RELEVANT,
             count=100,
         )
-        
-        # Process scraped data
+
         df = pd.DataFrame(result)
-        df = df[['score', 'content']].rename(columns={'score': 'rating', 'content': 'review'})
+        df = df[['score', 'content']]
+        df = df.rename(columns={'score': 'rating', 'content': 'review'})
         df.drop_duplicates(subset='review', inplace=True)
-        
-        # Predict sentiment and category
-        predictions = []
-        for review in df['review']:
-            try:
-                sentiment, category = analyzer.predict_sentiment_and_category(review)
-                predictions.append({'sentiment': sentiment, 'kategori': category})
-            except Exception as e:
-                app.logger.warning(f"Error predicting for review: {str(e)}")
-                predictions.append({'sentiment': 'unknown', 'kategori': 'unknown'})
-        
-        pred_df = pd.DataFrame(predictions)
-        df = pd.concat([df, pred_df], axis=1)
+
+        # Preprocessing
+        df['review_clean'] = df['review'].apply(preprocess_text)
+
+        # Load models
+        models = load_models("trying")
+
+        # Sentiment prediction
+        seq = models["tokenizer"].texts_to_sequences(df['review_clean'].tolist())
+        padded = pad_sequences(seq, maxlen=models["max_len"], padding='post')
+        pred_sentiments = models["sentiment_model"].predict(padded)
+        labels_sent = (pred_sentiments > 0.5).astype(int).flatten()
+        df['sentiment'] = models["label_encoder_sentimen"].inverse_transform(labels_sent)
+
+        # Kategori prediction
+        tfidf_input = models["tfidf_vectorizer"].transform(df['review_clean'].tolist())
+        pred_kategori = models["kategori_model"].predict(tfidf_input)
+        df['kategori'] = models["label_encoder_kategori"].inverse_transform(pred_kategori)
+
+        # Tambahkan tanggal scraping
         df['tanggal'] = datetime.now().strftime('%Y-%m-%d')
-        
-        # Merge with existing dataset
-        try:
-            existing_df = data_manager.load_dataset(source)
-            max_batch = existing_df['batch'].max() if 'batch' in existing_df.columns else 0
+
+        # Simpan ke file kategori.xlsx
+        save_path = dataset_path(source)
+        # Hitung batch keberapa
+        if os.path.exists(save_path):
+            existing_df = pd.read_excel(save_path)
+
+            # Pastikan kolom 'tanggal' dan 'batch' ada
+            if 'tanggal' not in existing_df.columns:
+                existing_df['tanggal'] = pd.NaT
+            if 'batch' not in existing_df.columns:
+                existing_df['batch'] = 1  # asumsikan data lama masuk ke batch 1
+
+            max_batch = existing_df['batch'].max()
             current_batch = max_batch + 1
-        except:
+        else:
             existing_df = pd.DataFrame()
             current_batch = 1
-        
-        df['batch'] = current_batch
-        
-        # Filter out duplicates
-        if not existing_df.empty:
-            existing_reviews = set(existing_df['review'].dropna().astype(str))
-            new_data = df[~df['review'].astype(str).isin(existing_reviews)]
-            
-            if new_data.empty:
-                return create_success_response({"new_count": 0}, "No new data to update")
-            
-            combined = pd.concat([existing_df, new_data], ignore_index=True)
-        else:
-            combined = df
-            new_data = df
-        
-        data_manager.save_dataset(combined, source)
-        
-        return create_success_response(
-            {"new_count": len(new_data)}, 
-            "Dataset updated successfully"
-        )
-        
-    except Exception as e:
-        app.logger.error(f"Error updating dataset for {source}: {str(e)}")
-        return create_error_response(f"Failed to update dataset: {str(e)}", 500)
 
+        # Tambahkan kolom batch ke data baru
+        df['batch'] = current_batch
+
+        # Gabungkan dengan dataset lama
+        new_data = df[['sentiment', 'kategori', 'review', 'tanggal', 'batch']]
+        if not existing_df.empty:
+            existing_reviews_set = set(existing_df['review'].dropna().astype(str))
+            new_data_filtered = new_data[~new_data['review'].astype(str).isin(existing_reviews_set)]
+
+            if new_data_filtered.empty:
+                return jsonify({"message": "Tidak ada pembaruan dataset terbaru", "new_count": 0})
+
+            new_data_filtered['batch'] = current_batch
+            combined = pd.concat([existing_df, new_data_filtered], ignore_index=True)
+            combined.to_excel(save_path, index=False)
+
+            return jsonify({"message": "Dataset updated successfully", "new_count": len(new_data_filtered)})
+
+        else:
+            combined = new_data
+
+        combined.to_excel(save_path, index=False)
+
+        return jsonify({"message": "Dataset updated successfully", "new_count": len(df)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# API analisis - Fixed version
 @app.route("/analyze", methods=["POST"])
-def analyze_review():
-    """Analyze single review for sentiment and category"""
+def analyze():
     try:
         data = request.get_json()
         if not data:
-            return create_error_response("No data provided")
-        
+            return jsonify({"error": "No data provided"}), 400
+            
         review = data.get("review", "").strip()
+        
         if not review:
-            return create_error_response("Review cannot be empty")
-        
-        sentiment, category = analyzer.predict_sentiment_and_category(review)
-        
-        result = {
-            "review": review,
-            "sentimen": sentiment,
-            "kategori": category
-        }
-        
-        return create_success_response(result)
-        
-    except Exception as e:
-        app.logger.error(f"Error analyzing review: {str(e)}")
-        return create_error_response(f"Failed to analyze review: {str(e)}", 500)
+            return jsonify({"error": "Review tidak boleh kosong"}), 400
 
+        # Load models
+        models = load_models("trying")
+        if not models:
+            return jsonify({"error": "Model tidak dapat dimuat"}), 500
+
+        # Preprocess and analyze
+        cleaned_review = preprocess_text(review)
+
+        # === Prediksi Sentimen ===
+        seq = models["tokenizer"].texts_to_sequences([cleaned_review])
+        padded = pad_sequences(seq, maxlen=models["max_len"], padding='post')
+        sent_pred = models["sentiment_model"].predict(padded)[0][0]
+        sent_label = 1 if sent_pred > 0.5 else 0
+        sent_result = models["label_encoder_sentimen"].inverse_transform([sent_label])[0]
+
+        # === Prediksi Kategori ===
+        tfidf_input = models["tfidf_vectorizer"].transform([cleaned_review])
+        kategori_pred = models["kategori_model"].predict(tfidf_input)
+        kategori_label = models["label_encoder_kategori"].inverse_transform(kategori_pred)[0]
+
+        return jsonify({
+            "review": review,
+            "sentimen": sent_result,
+            "kategori": kategori_label
+        })
+
+    except Exception as e:
+        print(f"Error in analyze: {str(e)}")
+        return jsonify({"error": f"Gagal menganalisis review: {str(e)}"}), 500
+
+# API get data user - Fixed version
 @app.route("/dataset-user", methods=["GET"])
 def get_user_dataset():
-    """Get user dataset"""
     try:
-        df = data_manager.load_dataset('user')
+        file_path = dataset_path('user')
+        if not os.path.exists(file_path):
+            # Create empty file if doesn't exist
+            df = pd.DataFrame(columns=["review", "sentiment", "kategori", "tanggal"])
+            df.to_excel(file_path, index=False)
+            return jsonify([])
+
+        df = pd.read_excel(file_path)
         
-        # Sort by batch or date if available
-        if 'batch' in df.columns:
-            df = df.sort_values(by='batch', ascending=False)
-        elif 'tanggal' in df.columns:
-            try:
+        # Normalize column names
+        df.columns = [col.lower().strip() for col in df.columns]
+        
+        # Ensure required columns exist
+        required_columns = ['review', 'sentiment', 'kategori', 'tanggal']
+        for col in required_columns:
+            if col not in df.columns:
+                df[col] = ""
+
+        # Sort by date if possible, otherwise by index (newest first)
+        try:
+            if 'batch' in df.columns:
+                df = df.sort_values(by='batch', ascending=False)
+            elif 'tanggal' in df.columns:
+                # Try to sort by date
                 df['tanggal_sort'] = pd.to_datetime(df['tanggal'], format='%d-%m-%Y', errors='coerce')
                 df = df.sort_values(by='tanggal_sort', ascending=False, na_position='last')
                 df = df.drop('tanggal_sort', axis=1)
-            except:
-                pass
+            else:
+                # Sort by index (newest first)
+                df = df.iloc[::-1]
+        except Exception as sort_error:
+            print(f"Sorting error: {sort_error}")
+            # Continue without sorting
+
+        # Select only required columns and convert to records
+        data_columns = ['review', 'sentiment', 'kategori', 'tanggal']
+        available_columns = [col for col in data_columns if col in df.columns]
         
-        # Clean data
-        for col in REQUIRED_COLUMNS:
-            if col in df.columns:
-                df[col] = df[col].fillna("")
+        # Fill missing values
+        for col in available_columns:
+            df[col] = df[col].fillna("")
         
-        data = df[REQUIRED_COLUMNS].to_dict(orient="records")
-        return create_success_response(data)
+        data = df[available_columns].to_dict(orient="records")
+        
+        return jsonify(data)
         
     except Exception as e:
-        app.logger.error(f"Error getting user dataset: {str(e)}")
-        return create_error_response(f"Failed to get user dataset: {str(e)}", 500)
+        print(f"Error in get_user_dataset: {str(e)}")
+        return jsonify({"error": f"Gagal membaca dataset user: {str(e)}"}), 500
 
-@app.route("/save-user-sentiment", methods=["POST"])
-def save_user_sentiment():
-    """Save user sentiment data"""
-    try:
-        data = request.json
-        if not data:
-            return create_error_response("No data provided")
-        
-        review = data.get("review", "").strip()
-        sentimen = data.get("sentimen", "").strip()
-        kategori = data.get("kategori", "").strip()
-        
-        if not all([review, sentimen, kategori]):
-            return create_error_response("Incomplete data")
-        
-        df = data_manager.load_dataset('user')
-        
-        # Check for duplicates
-        df['review'] = df['review'].astype(str).str.strip()
-        if review in df["review"].values:
-            return create_error_response("Review already exists in database")
-        
-        # Add new row
-        new_row = pd.DataFrame([{
-            "review": review,
-            "sentiment": sentimen,
-            "kategori": kategori,
-            "tanggal": datetime.now().strftime("%d-%m-%Y")
-        }])
-        
-        df = pd.concat([df, new_row], ignore_index=True)
-        data_manager.save_dataset(df, 'user')
-        
-        return create_success_response({}, "Data saved successfully")
-        
-    except Exception as e:
-        app.logger.error(f"Error saving user sentiment: {str(e)}")
-        return create_error_response(f"Failed to save data: {str(e)}", 500)
-
+# API update dataset user - Fixed version
 @app.route("/update-user", methods=["POST"])
 def update_user_sentiment():
-    """Update user sentiment data"""
     try:
         data = request.json
         if not data:
-            return create_error_response("No data provided")
-        
+            return jsonify({"error": "No data provided"}), 400
+            
         review_to_update = data.get("review", "").strip()
         new_sentiment = data.get("sentimen", "").strip()
         new_kategori = data.get("kategori", "").strip()
         
         if not all([review_to_update, new_sentiment, new_kategori]):
-            return create_error_response("Incomplete data")
+            return jsonify({"error": "Data tidak lengkap"}), 400
+
+        new_tanggal = datetime.now().strftime("%d-%m-%Y")
+
+        file_path = dataset_path('user')
+        if not os.path.exists(file_path):
+            return jsonify({"error": "File dataset tidak ditemukan"}), 404
+
+        df = pd.read_excel(file_path)
         
-        df = data_manager.load_dataset('user')
+        # Normalize column names
+        df.columns = [col.lower().strip() for col in df.columns]
+        
+        # Ensure review column exists and convert to string
+        if 'review' not in df.columns:
+            return jsonify({"error": "Kolom review tidak ditemukan"}), 404
+            
         df['review'] = df['review'].astype(str).str.strip()
-        
+
+        # Find the review to update
         matching_rows = df[df['review'] == review_to_update]
-        if matching_rows.empty:
-            return create_error_response("Review not found")
         
-        # Update first matching row
+        if matching_rows.empty:
+            return jsonify({"error": "Review tidak ditemukan untuk diupdate"}), 404
+
+        # Update the first matching row
         idx = matching_rows.index[0]
         df.loc[idx, 'sentiment'] = new_sentiment
         df.loc[idx, 'kategori'] = new_kategori
-        df.loc[idx, 'tanggal'] = datetime.now().strftime("%d-%m-%Y")
+        df.loc[idx, 'tanggal'] = new_tanggal
         
-        data_manager.save_dataset(df, 'user')
-        
-        return create_success_response({}, "Data updated successfully")
+        # Save the updated dataframe
+        df.to_excel(file_path, index=False)
+
+        return jsonify({"success": True, "message": "Data berhasil diperbarui."})
         
     except Exception as e:
-        app.logger.error(f"Error updating user sentiment: {str(e)}")
-        return create_error_response(f"Failed to update data: {str(e)}", 500)
+        print(f"Error in update_user_sentiment: {str(e)}")
+        return jsonify({"error": f"Gagal memperbarui data: {str(e)}"}), 500
 
-@app.route("/delete-user", methods=["POST"])
-def delete_user_sentiment():
-    """Delete user sentiment data"""
+# API save dataset user - Fixed version
+@app.route("/save-user-sentiment", methods=["POST"])
+def save_user_sentiment():
     try:
         data = request.json
         if not data:
-            return create_error_response("No data provided")
+            return jsonify({"error": "No data provided"}), 400
+            
+        review = data.get("review", "").strip()
+        sentimen = data.get("sentimen", "").strip()
+        kategori = data.get("kategori", "").strip()
         
-        review_to_delete = data.get("review", "").strip()
-        if not review_to_delete:
-            return create_error_response("Review cannot be empty")
+        if not all([review, sentimen, kategori]):
+            return jsonify({"error": "Data tidak lengkap"}), 400
+
+        tanggal = datetime.now().strftime("%d-%m-%Y")
+
+        file_path = dataset_path('user')
         
-        df = data_manager.load_dataset('user')
+        # Load existing data or create new dataframe
+        if os.path.exists(file_path):
+            df = pd.read_excel(file_path)
+            # Normalize column names
+            df.columns = [col.lower().strip() for col in df.columns]
+            
+            # Ensure required columns exist
+            required_columns = ["review", "sentiment", "kategori", "tanggal"]
+            for col in required_columns:
+                if col not in df.columns:
+                    df[col] = ""
+        else:
+            df = pd.DataFrame(columns=["review", "sentiment", "kategori", "tanggal"])
+
+        # Convert review column to string for comparison
         df['review'] = df['review'].astype(str).str.strip()
+
+        # Check if review already exists
+        if review in df["review"].values:
+            return jsonify({"error": "Review sudah ada dalam database"}), 400
+
+        # Create new row
+        new_row = pd.DataFrame([{
+            "review": review,
+            "sentiment": sentimen,
+            "kategori": kategori,
+            "tanggal": tanggal
+        }])
         
+        # Append new row
+        df = pd.concat([df, new_row], ignore_index=True)
+        
+        # Save to file
+        df.to_excel(file_path, index=False)
+
+        return jsonify({"success": True, "message": "Data berhasil disimpan."})
+        
+    except Exception as e:
+        print(f"Error in save_user_sentiment: {str(e)}")
+        return jsonify({"error": f"Gagal menyimpan data: {str(e)}"}), 500
+
+# API delete dataset user - New addition
+@app.route("/delete-user", methods=["POST"])
+def delete_user_sentiment():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        review_to_delete = data.get("review", "").strip()
+        
+        if not review_to_delete:
+            return jsonify({"error": "Review tidak boleh kosong"}), 400
+
+        file_path = dataset_path('user')
+        if not os.path.exists(file_path):
+            return jsonify({"error": "File dataset tidak ditemukan"}), 404
+
+        df = pd.read_excel(file_path)
+        
+        # Normalize column names
+        df.columns = [col.lower().strip() for col in df.columns]
+        
+        # Ensure review column exists and convert to string
+        if 'review' not in df.columns:
+            return jsonify({"error": "Kolom review tidak ditemukan"}), 404
+            
+        df['review'] = df['review'].astype(str).str.strip()
+
+        # Find and remove the review
         initial_count = len(df)
         df = df[df['review'] != review_to_delete]
         
         if len(df) == initial_count:
-            return create_error_response("Review not found")
+            return jsonify({"error": "Review tidak ditemukan"}), 404
         
-        data_manager.save_dataset(df, 'user')
-        
-        return create_success_response({}, "Data deleted successfully")
+        # Save the updated dataframe
+        df.to_excel(file_path, index=False)
+
+        return jsonify({"success": True, "message": "Data berhasil dihapus."})
         
     except Exception as e:
-        app.logger.error(f"Error deleting user sentiment: {str(e)}")
-        return create_error_response(f"Failed to delete data: {str(e)}", 500)
+        print(f"Error in delete_user_sentiment: {str(e)}")
+        return jsonify({"error": f"Gagal menghapus data: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(debug=True, host="localhost", port=5000)
