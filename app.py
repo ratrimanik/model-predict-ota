@@ -48,9 +48,15 @@ def load_models(source_folder):
         "label_encoder_kategori": label_encoder_kategori
     }
 
-# Helper Function
+# Helper Function join path
 def dataset_path(source):
     return os.path.join(os.getcwd(), source, 'kategori.xlsx')
+
+# Helper function untuk generate ID unik
+def generate_unique_id(df):
+    if df.empty or 'id' not in df.columns:
+        return 1
+    return df['id'].max() + 1
 
 # API tampil dataset
 @app.route("/dataset", methods=["GET"])
@@ -352,14 +358,14 @@ def analyze():
         print(f"Error in analyze: {str(e)}")
         return jsonify({"error": f"Gagal menganalisis review: {str(e)}"}), 500
 
-# API get data user - Fixed version
+# API get data user - Fixed version dengan ID
 @app.route("/dataset-user", methods=["GET"])
 def get_user_dataset():
     try:
         file_path = dataset_path('user')
         if not os.path.exists(file_path):
             # Create empty file if doesn't exist
-            df = pd.DataFrame(columns=["review", "sentiment", "kategori", "tanggal"])
+            df = pd.DataFrame(columns=["id", "review", "sentiment", "kategori", "tanggal"])
             df.to_excel(file_path, index=False)
             return jsonify([])
 
@@ -369,34 +375,28 @@ def get_user_dataset():
         df.columns = [col.lower().strip() for col in df.columns]
         
         # Ensure required columns exist
-        required_columns = ['review', 'sentiment', 'kategori', 'tanggal']
+        required_columns = ['id', 'review', 'sentiment', 'kategori', 'tanggal']
         for col in required_columns:
             if col not in df.columns:
-                df[col] = ""
+                if col == 'id':
+                    df[col] = range(1, len(df) + 1)
+                else:
+                    df[col] = ""
 
-        # Sort by date if possible, otherwise by index (newest first)
-        try:
-            if 'batch' in df.columns:
-                df = df.sort_values(by='batch', ascending=False)
-            elif 'tanggal' in df.columns:
-                # Try to sort by date
-                df['tanggal_sort'] = pd.to_datetime(df['tanggal'], format='%d-%m-%Y', errors='coerce')
-                df = df.sort_values(by='tanggal_sort', ascending=False, na_position='last')
-                df = df.drop('tanggal_sort', axis=1)
-            else:
-                # Sort by index (newest first)
-                df = df.iloc[::-1]
-        except Exception as sort_error:
-            print(f"Sorting error: {sort_error}")
-            # Continue without sorting
-
+        # Convert ID to integer
+        df['id'] = pd.to_numeric(df['id'], errors='coerce').fillna(0).astype(int)
+        
+        # Sort by ID descending (newest first)
+        df = df.sort_values(by='id', ascending=False)
+        
         # Select only required columns and convert to records
-        data_columns = ['review', 'sentiment', 'kategori', 'tanggal']
+        data_columns = ['id', 'review', 'sentiment', 'kategori', 'tanggal']
         available_columns = [col for col in data_columns if col in df.columns]
         
         # Fill missing values
         for col in available_columns:
-            df[col] = df[col].fillna("")
+            if col != 'id':
+                df[col] = df[col].fillna("")
         
         data = df[available_columns].to_dict(orient="records")
         
@@ -406,7 +406,7 @@ def get_user_dataset():
         print(f"Error in get_user_dataset: {str(e)}")
         return jsonify({"error": f"Gagal membaca dataset user: {str(e)}"}), 500
 
-# API update dataset user - Fixed version
+# API update dataset user - Fixed version with better column handling
 @app.route("/update-user", methods=["POST"])
 def update_user_sentiment():
     try:
@@ -414,12 +414,15 @@ def update_user_sentiment():
         if not data:
             return jsonify({"error": "No data provided"}), 400
             
-        review_to_update = data.get("review", "").strip()
+        record_id = data.get("id")
+        new_review = data.get("review", "").strip()
         new_sentiment = data.get("sentimen", "").strip()
         new_kategori = data.get("kategori", "").strip()
         
-        if not all([review_to_update, new_sentiment, new_kategori]):
-            return jsonify({"error": "Data tidak lengkap"}), 400
+        print(f"Received update request: ID={record_id}, Review={new_review[:50]}..., Sentiment={new_sentiment}, Category={new_kategori}")
+        
+        if not all([record_id, new_sentiment, new_kategori]):
+            return jsonify({"error": "Data tidak lengkap (ID, sentimen, dan kategori diperlukan)"}), 400
 
         new_tanggal = datetime.now().strftime("%d-%m-%Y")
 
@@ -429,37 +432,110 @@ def update_user_sentiment():
 
         df = pd.read_excel(file_path)
         
-        # Normalize column names
-        df.columns = [col.lower().strip() for col in df.columns]
+        # Debug: Print original column names
+        print(f"Original columns: {list(df.columns)}")
         
-        # Ensure review column exists and convert to string
-        if 'review' not in df.columns:
-            return jsonify({"error": "Kolom review tidak ditemukan"}), 404
-            
-        df['review'] = df['review'].astype(str).str.strip()
+        # Create a mapping of original columns to standardized names
+        column_mapping = {}
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            if 'id' in col_lower:
+                column_mapping[col] = 'id'
+            elif 'review' in col_lower or 'ulasan' in col_lower:
+                column_mapping[col] = 'review'
+            elif 'sentiment' in col_lower or 'sentimen' in col_lower:
+                column_mapping[col] = 'sentiment'
+            elif 'kategori' in col_lower or 'category' in col_lower:
+                column_mapping[col] = 'kategori'
+            elif 'tanggal' in col_lower or 'date' in col_lower:
+                column_mapping[col] = 'tanggal'
+            else:
+                column_mapping[col] = col_lower.strip()
+        
+        # Rename columns using the mapping
+        df = df.rename(columns=column_mapping)
+        
+        print(f"Mapped columns: {list(df.columns)}")
+        
+        # Check if required columns exist
+        required_columns = ['id', 'review', 'sentiment', 'kategori', 'tanggal']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            return jsonify({"error": f"Kolom yang diperlukan tidak ditemukan: {missing_columns}. Kolom yang tersedia: {list(df.columns)}"}), 400
+        
+        # Ensure ID column is numeric and handle any conversion issues
+        try:
+            df['id'] = pd.to_numeric(df['id'], errors='coerce')
+            # Remove rows with invalid IDs (NaN)
+            df = df.dropna(subset=['id'])
+            df['id'] = df['id'].astype(int)
+        except Exception as e:
+            return jsonify({"error": f"Error processing ID column: {str(e)}"}), 500
 
-        # Find the review to update
-        matching_rows = df[df['review'] == review_to_update]
+        # Find the record to update by ID
+        record_id_int = int(record_id)
+        matching_rows = df[df['id'] == record_id_int]
+        
+        print(f"Looking for ID {record_id_int}, found {len(matching_rows)} matching rows")
         
         if matching_rows.empty:
-            return jsonify({"error": "Review tidak ditemukan untuk diupdate"}), 404
+            available_ids = df['id'].tolist()
+            return jsonify({"error": f"Data dengan ID {record_id} tidak ditemukan. ID yang tersedia: {available_ids}"}), 404
 
-        # Update the first matching row
+        # Check if new review text already exists in other records (exclude current record)
+        if new_review:
+            df['review'] = df['review'].astype(str).str.strip()
+            existing_review = df[(df['review'] == new_review) & (df['id'] != record_id_int)]
+            if not existing_review.empty:
+                existing_id = existing_review.iloc[0]['id']
+                return jsonify({"error": f"Review text sudah ada dalam database dengan ID {existing_id}"}), 400
+
+        # Update the record
         idx = matching_rows.index[0]
+        
+        print(f"Updating record at index {idx}")
+        
+        # Update review text if provided
+        if new_review:
+            df.loc[idx, 'review'] = new_review
+            
         df.loc[idx, 'sentiment'] = new_sentiment
         df.loc[idx, 'kategori'] = new_kategori
         df.loc[idx, 'tanggal'] = new_tanggal
         
         # Save the updated dataframe
-        df.to_excel(file_path, index=False)
+        try:
+            df.to_excel(file_path, index=False)
+            print(f"Successfully updated record ID {record_id}")
+        except Exception as e:
+            return jsonify({"error": f"Gagal menyimpan file: {str(e)}"}), 500
 
-        return jsonify({"success": True, "message": "Data berhasil diperbarui."})
+        update_message = f"Data dengan ID {record_id} berhasil diperbarui."
+        if new_review:
+            update_message += " Review text juga telah diperbarui."
+
+        return jsonify({
+            "success": True, 
+            "message": update_message,
+            "id": record_id,
+            "updated_data": {
+                "review": new_review if new_review else df.loc[idx, 'review'],
+                "sentiment": new_sentiment,
+                "kategori": new_kategori,
+                "tanggal": new_tanggal
+            }
+        })
         
+    except ValueError as e:
+        return jsonify({"error": f"Invalid ID format: {str(e)}"}), 400
     except Exception as e:
         print(f"Error in update_user_sentiment: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": f"Gagal memperbarui data: {str(e)}"}), 500
 
-# API save dataset user - Fixed version
+# API save dataset user - Fixed version dengan ID
 @app.route("/save-user-sentiment", methods=["POST"])
 def save_user_sentiment():
     try:
@@ -485,12 +561,19 @@ def save_user_sentiment():
             df.columns = [col.lower().strip() for col in df.columns]
             
             # Ensure required columns exist
-            required_columns = ["review", "sentiment", "kategori", "tanggal"]
+            required_columns = ["id", "review", "sentiment", "kategori", "tanggal"]
             for col in required_columns:
                 if col not in df.columns:
-                    df[col] = ""
+                    if col == 'id':
+                        df[col] = range(1, len(df) + 1) if not df.empty else []
+                    else:
+                        df[col] = ""
         else:
-            df = pd.DataFrame(columns=["review", "sentiment", "kategori", "tanggal"])
+            df = pd.DataFrame(columns=["id", "review", "sentiment", "kategori", "tanggal"])
+
+        # Convert ID to integer if exists
+        if not df.empty and 'id' in df.columns:
+            df['id'] = pd.to_numeric(df['id'], errors='coerce').fillna(0).astype(int)
 
         # Convert review column to string for comparison
         df['review'] = df['review'].astype(str).str.strip()
@@ -499,8 +582,12 @@ def save_user_sentiment():
         if review in df["review"].values:
             return jsonify({"error": "Review sudah ada dalam database"}), 400
 
+        # Generate new ID
+        new_id = generate_unique_id(df)
+
         # Create new row
         new_row = pd.DataFrame([{
+            "id": new_id,
             "review": review,
             "sentiment": sentimen,
             "kategori": kategori,
@@ -513,13 +600,17 @@ def save_user_sentiment():
         # Save to file
         df.to_excel(file_path, index=False)
 
-        return jsonify({"success": True, "message": "Data berhasil disimpan."})
+        return jsonify({
+            "success": True, 
+            "message": "Data berhasil disimpan.",
+            "id": new_id
+        })
         
     except Exception as e:
         print(f"Error in save_user_sentiment: {str(e)}")
         return jsonify({"error": f"Gagal menyimpan data: {str(e)}"}), 500
 
-# API delete dataset user - New addition
+# API delete user data - Implementasi yang hilang
 @app.route("/delete-user", methods=["POST"])
 def delete_user_sentiment():
     try:
@@ -527,10 +618,10 @@ def delete_user_sentiment():
         if not data:
             return jsonify({"error": "No data provided"}), 400
             
-        review_to_delete = data.get("review", "").strip()
+        record_id = data.get("id")
         
-        if not review_to_delete:
-            return jsonify({"error": "Review tidak boleh kosong"}), 400
+        if not record_id:
+            return jsonify({"error": "ID diperlukan untuk menghapus data"}), 400
 
         file_path = dataset_path('user')
         if not os.path.exists(file_path):
@@ -541,27 +632,32 @@ def delete_user_sentiment():
         # Normalize column names
         df.columns = [col.lower().strip() for col in df.columns]
         
-        # Ensure review column exists and convert to string
-        if 'review' not in df.columns:
-            return jsonify({"error": "Kolom review tidak ditemukan"}), 404
+        # Ensure ID column exists
+        if 'id' not in df.columns:
+            return jsonify({"error": "Kolom ID tidak ditemukan"}), 404
             
-        df['review'] = df['review'].astype(str).str.strip()
+        df['id'] = pd.to_numeric(df['id'], errors='coerce').fillna(0).astype(int)
 
-        # Find and remove the review
-        initial_count = len(df)
-        df = df[df['review'] != review_to_delete]
+        # Find the record to delete
+        matching_rows = df[df['id'] == int(record_id)]
         
-        if len(df) == initial_count:
-            return jsonify({"error": "Review tidak ditemukan"}), 404
+        if matching_rows.empty:
+            return jsonify({"error": f"Data dengan ID {record_id} tidak ditemukan"}), 404
+
+        # Remove the record
+        df = df[df['id'] != int(record_id)]
         
         # Save the updated dataframe
         df.to_excel(file_path, index=False)
 
-        return jsonify({"success": True, "message": "Data berhasil dihapus."})
+        return jsonify({
+            "success": True, 
+            "message": f"Data dengan ID {record_id} berhasil dihapus."
+        })
         
     except Exception as e:
         print(f"Error in delete_user_sentiment: {str(e)}")
         return jsonify({"error": f"Gagal menghapus data: {str(e)}"}), 500
-
+    
 if __name__ == "__main__":
     app.run(debug=True, host="localhost", port=5000)
