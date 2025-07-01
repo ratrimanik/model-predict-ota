@@ -350,8 +350,8 @@ def analyze():
 
         return jsonify({
             "review": review,
-            "sentimen": sent_result,
-            "kategori": kategori_label
+            "sentimen": str(sent_result),
+            "kategori": str(kategori_label)
         })
 
     except Exception as e:
@@ -603,8 +603,9 @@ def save_user_sentiment():
         return jsonify({
             "success": True, 
             "message": "Data berhasil disimpan.",
-            "id": new_id
+            "id": int(new_id)  # konversi ke int standar Python
         })
+
         
     except Exception as e:
         print(f"Error in save_user_sentiment: {str(e)}")
